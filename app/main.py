@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import logging
 import re
 import time
@@ -8,25 +8,29 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.config import Settings
-from app.services.buddha_bot import ask_buddha
 from app.services.content_extractor import extract_content, extract_first_url
 from app.services.job_store import JobStore
+from app.services.knowledge_service import KnowledgeService
 from app.services.summarizer import summarize_content
 
 load_dotenv()
 settings = Settings.from_env()
+knowledge_service = KnowledgeService(settings)
 summary_job_store = JobStore()
-buddha_job_store = JobStore()
+knowledge_job_store = JobStore()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Kakao Multi-Bot Skill Server")
+app = FastAPI(title="Kakao Summary Bot Skill Server")
 
 MAX_SIMPLE_TEXT_LEN = 900
 MAX_OUTPUTS = 3
 RESULT_CMD_PATTERN = re.compile(r"^\s*/?결과\s+([A-Za-z0-9]{6,20})\s*$")
-BUDDHA_ROUTE_KEYWORDS = ("부처님", "붓다")
+KNOWLEDGE_SEARCH_PATTERN = re.compile(r"^\s*지식\s*검색\s+(.+?)\s*$")
+KNOWLEDGE_ASK_PATTERN = re.compile(r"^\s*지식\s*질문\s+(.+?)\s*$")
+RECENT_DOCS_PATTERN = re.compile(r"^\s*(최근\s*문서|최근문서)\s*$")
+CATEGORY_LIST_PATTERN = re.compile(r"^\s*(카테고리\s*목록|카테고리목록)\s*$")
 
 
 def _sanitize_text(text: str) -> str:
@@ -73,6 +77,13 @@ def kakao_simple_text(text: str) -> dict:
             "outputs": outputs,
         },
     }
+
+
+def kakao_text_response(text: str, quick_replies: list[dict] | None = None) -> dict:
+    response = kakao_simple_text(text)
+    if quick_replies:
+        response["template"]["quickReplies"] = quick_replies
+    return response
 
 
 def kakao_job_accepted(job_id: str, job_name: str = "요약", result_cmd: str = "/결과") -> dict:
@@ -155,22 +166,26 @@ def _extract_url(payload: dict, utterance: str) -> str | None:
     return None
 
 
-def _extract_question(payload: dict, utterance: str) -> str:
-    if utterance.strip():
-        return utterance.strip()
-
-    action = payload.get("action", {})
-    params = action.get("params", {}) if isinstance(action, dict) else {}
-    question = params.get("question") if isinstance(params, dict) else None
-    if isinstance(question, str):
-        return question.strip()
-    return ""
+def _extract_knowledge_search_query(utterance: str) -> str | None:
+    match = KNOWLEDGE_SEARCH_PATTERN.match(utterance or "")
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
-def _should_route_to_buddha(utterance: str) -> bool:
-    if not utterance:
-        return False
-    return any(keyword in utterance for keyword in BUDDHA_ROUTE_KEYWORDS)
+def _extract_knowledge_ask_query(utterance: str) -> str | None:
+    match = KNOWLEDGE_ASK_PATTERN.match(utterance or "")
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _is_recent_documents_command(utterance: str) -> bool:
+    return bool(RECENT_DOCS_PATTERN.match(utterance or ""))
+
+
+def _is_category_list_command(utterance: str) -> bool:
+    return bool(CATEGORY_LIST_PATTERN.match(utterance or ""))
 
 
 def _build_summary_help_message() -> str:
@@ -180,17 +195,95 @@ def _build_summary_help_message() -> str:
         "2) 안내받은 요청 ID로 '/결과 <요청ID>'를 보내면 결과를 확인할 수 있습니다.\n\n"
         "예시\n"
         "- 요약 https://example.com/news\n"
-        "- /결과 ABC123XYZ"
+        "- /결과 ABC123XYZ\n\n"
+        "지식 기능\n"
+        "- 지식 검색 <키워드>\n"
+        "- 지식 질문 <질문>\n"
+        "- 최근 문서\n"
+        "- 카테고리 목록"
     )
 
 
-def _build_buddha_help_message() -> str:
+def _build_knowledge_help_message() -> str:
     return (
-        "질문을 보내주세요.\n"
-        "답변은 5초 제한 때문에 비동기로 생성됩니다.\n"
-        "안내된 요청 ID로 '/결과 <요청ID>'를 보내 확인할 수 있습니다.\n\n"
-        "예: 부처님이라면 팀 갈등을 어떻게 보라고 하실까요?"
+        "지식 기능 사용법\n"
+        "- 지식 검색 <키워드>\n"
+        "- 지식 질문 <질문>\n"
+        "- 최근 문서\n"
+        "- 카테고리 목록\n\n"
+        "예시\n"
+        "- 지식 검색 Places API\n"
+        "- 지식 질문 내가 저장한 문서 기준으로 Places API 핵심을 알려줘"
     )
+
+
+def _build_knowledge_quick_replies() -> list[dict]:
+    return [
+        {"label": "최근 문서", "action": "message", "messageText": "최근 문서"},
+        {"label": "카테고리 목록", "action": "message", "messageText": "카테고리 목록"},
+    ]
+
+
+def _format_knowledge_search_results(query: str, items: list[dict]) -> str:
+    unique_items: list[dict] = []
+    seen_keys: set[str] = set()
+    for item in items:
+        key = str(item.get("source_url") or item.get("document_id") or item.get("title") or "")
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_items.append(item)
+
+    if not unique_items:
+        return (
+            f"'{query}'에 대한 저장 문서를 찾지 못했습니다.\n"
+            "다른 키워드로 다시 검색해 주세요."
+        )
+
+    lines = [f"[지식 검색] '{query}' 결과 {len(unique_items)}건"]
+    for idx, item in enumerate(unique_items[:5], start=1):
+        title = str(item.get("title", "")).strip() or "Untitled"
+        category = str(item.get("category", "")).strip() or "-"
+        source_url = str(item.get("source_url", "")).strip()
+        lines.append(f"{idx}. {title}")
+        lines.append(f"카테고리: {category}")
+        if source_url:
+            lines.append(source_url)
+        snippet = str(item.get("chunk_text", "")).strip()
+        if snippet:
+            lines.append(snippet[:180])
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _format_recent_documents(items: list[dict]) -> str:
+    if not items:
+        return "저장된 문서가 없습니다."
+
+    lines = [f"[최근 문서] {len(items)}건"]
+    for idx, item in enumerate(items[:5], start=1):
+        title = str(item.get("title", "")).strip() or "Untitled"
+        category = str(item.get("category", "")).strip() or "-"
+        source_type = str(item.get("source_type", "")).strip() or "-"
+        source_url = str(item.get("source_url", "")).strip()
+        lines.append(f"{idx}. {title}")
+        lines.append(f"{category} / {source_type}")
+        if source_url:
+            lines.append(source_url)
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _format_category_list(items: list[dict]) -> str:
+    if not items:
+        return "저장된 카테고리가 없습니다."
+
+    lines = ["[카테고리 목록]"]
+    for item in items:
+        category = str(item.get("category", "")).strip() or "-"
+        count = int(item.get("document_count", 0) or 0)
+        lines.append(f"- {category}: {count}건")
+    return "\n".join(lines)
 
 
 def _build_result_message(
@@ -220,32 +313,19 @@ def _build_result_message(
     return job.result_text
 
 
-def _resolve_result_job(job_id: str) -> tuple[str, JobStore] | None:
-    summary_job = summary_job_store.get(job_id)
-    if summary_job is not None:
-        return ("summary", summary_job_store)
-
-    buddha_job = buddha_job_store.get(job_id)
-    if buddha_job is not None:
-        return ("buddha", buddha_job_store)
-
-    return None
-
-
 def _build_cross_result_response(job_id: str, result_cmd: str = "/결과") -> dict:
-    resolved = _resolve_result_job(job_id)
-    if not resolved:
-        return kakao_simple_text(
-            "요청 ID '{job_id}'를 찾지 못했습니다.\n"
-            "ID를 다시 확인해 주세요. (요청은 약 1시간 동안 조회 가능)".format(job_id=job_id)
-        )
+    for store in (summary_job_store, knowledge_job_store):
+        job = store.get(job_id)
+        if job is None:
+            continue
+        if job.status in ("queued", "processing"):
+            return kakao_job_processing(job_id, result_cmd=result_cmd)
+        return kakao_simple_text(_build_result_message(store, job_id, result_cmd=result_cmd))
 
-    _, store = resolved
-    job = store.get(job_id)
-    if job and job.status in ("queued", "processing"):
-        return kakao_job_processing(job_id, result_cmd=result_cmd)
-
-    return kakao_simple_text(_build_result_message(store, job_id, result_cmd=result_cmd))
+    return kakao_simple_text(
+        f"요청 ID '{job_id}'를 찾지 못했습니다.\n"
+        "ID를 다시 확인해 주세요. (요청은 약 1시간 동안 조회 가능)"
+    )
 
 
 async def _process_summary_job(job_id: str, url: str) -> None:
@@ -273,6 +353,18 @@ async def _process_summary_job(job_id: str, url: str) -> None:
             summarize_elapsed,
         )
 
+        persist_started = time.perf_counter()
+        try:
+            await knowledge_service.ingest_summary(content, summary)
+            persist_elapsed = time.perf_counter() - persist_started
+            logger.info(
+                "Knowledge persist done: id=%s elapsed=%.2fs",
+                job_id,
+                persist_elapsed,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Knowledge persist failed: id=%s url=%s", job_id, url)
+
         message = f"[요약 완료] {url}\n\n{summary}"
         summary_job_store.mark_done(job_id, message)
         elapsed = time.perf_counter() - started
@@ -282,33 +374,107 @@ async def _process_summary_job(job_id: str, url: str) -> None:
         summary_job_store.mark_failed(job_id, str(exc))
 
 
-async def _process_buddha_job(job_id: str, question: str) -> None:
+async def _process_knowledge_job(job_id: str, query: str) -> None:
     started = time.perf_counter()
-    buddha_job_store.mark_processing(job_id)
+    knowledge_job_store.mark_processing(job_id)
     try:
-        answer = await ask_buddha(question, settings)
-        message = f"[부처님 관점 답변]\n\n{answer}"
-        buddha_job_store.mark_done(job_id, message)
+        result = await knowledge_service.ask(query=query, limit=5)
+        message_parts = [f"[지식 답변]\n\n{result['answer']}"]
+        if result["sources"]:
+            message_parts.append("\n출처")
+            message_parts.extend(result["sources"])
+        message = "\n".join(message_parts)
+        knowledge_job_store.mark_done(job_id, message)
         elapsed = time.perf_counter() - started
-        logger.info("Buddha job done: id=%s, time=%.2fs, answer_len=%d", job_id, elapsed, len(answer))
+        logger.info("Knowledge job done: id=%s, time=%.2fs, answer_len=%d", job_id, elapsed, len(message))
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to process buddha job. id=%s", job_id)
-        buddha_job_store.mark_failed(job_id, str(exc))
+        logger.exception("Failed to process knowledge job. id=%s", job_id)
+        knowledge_job_store.mark_failed(job_id, str(exc))
 
 
-def _enqueue_buddha_job(payload: dict, utterance: str, background_tasks: BackgroundTasks) -> JSONResponse:
-    question = _extract_question(payload, utterance)
-    if not question:
-        return JSONResponse(kakao_simple_text(_build_buddha_help_message()))
+def _enqueue_knowledge_job(query: str, background_tasks: BackgroundTasks) -> JSONResponse:
+    if not query:
+        return JSONResponse(kakao_text_response(_build_knowledge_help_message(), _build_knowledge_quick_replies()))
 
-    job = buddha_job_store.create(question)
-    background_tasks.add_task(_process_buddha_job, job.job_id, question)
-    return JSONResponse(kakao_job_accepted(job.job_id, job_name="답변"))
+    job = knowledge_job_store.create(query)
+    background_tasks.add_task(_process_knowledge_job, job.job_id, query)
+    return JSONResponse(kakao_job_accepted(job.job_id, job_name="지식 답변"))
+
+
+async def _handle_knowledge_command(utterance: str, background_tasks: BackgroundTasks) -> JSONResponse | None:
+    search_query = _extract_knowledge_search_query(utterance)
+    if search_query is not None:
+        items = await knowledge_service.search(query=search_query, limit=5)
+        return JSONResponse(
+            kakao_text_response(_format_knowledge_search_results(search_query, items), _build_knowledge_quick_replies())
+        )
+
+    ask_query = _extract_knowledge_ask_query(utterance)
+    if ask_query is not None:
+        return _enqueue_knowledge_job(ask_query, background_tasks)
+
+    if _is_recent_documents_command(utterance):
+        items = await knowledge_service.recent_documents(limit=5)
+        return JSONResponse(
+            kakao_text_response(_format_recent_documents(items), _build_knowledge_quick_replies())
+        )
+
+    if _is_category_list_command(utterance):
+        items = await knowledge_service.list_categories()
+        return JSONResponse(
+            kakao_text_response(_format_category_list(items), _build_knowledge_quick_replies())
+        )
+
+    return None
 
 
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.post("/knowledge/search")
+async def knowledge_search(request: Request):
+    payload = await request.json()
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        return JSONResponse({"query": "", "count": 0, "items": []})
+
+    limit = int(payload.get("limit", 5))
+    category = payload.get("category")
+    category_str = str(category).strip() if isinstance(category, str) and category.strip() else None
+
+    items = await knowledge_service.search(query=query, limit=limit, category=category_str)
+    return JSONResponse({"query": query, "count": len(items), "items": items})
+
+
+@app.post("/knowledge/ask")
+async def knowledge_ask(request: Request):
+    payload = await request.json()
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        return JSONResponse(
+            {
+                "query": "",
+                "answer": "질문을 입력해 주세요.",
+                "sources": [],
+                "hits": [],
+            }
+        )
+
+    limit = int(payload.get("limit", 6))
+    category = payload.get("category")
+    category_str = str(category).strip() if isinstance(category, str) and category.strip() else None
+
+    result = await knowledge_service.ask(query=query, limit=limit, category=category_str)
+    return JSONResponse(
+        {
+            "query": query,
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "hits": result["hits"],
+        }
+    )
 
 
 @app.post("/kakao/skill")
@@ -320,8 +486,9 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
     if result_job_id:
         return JSONResponse(_build_cross_result_response(result_job_id))
 
-    if _should_route_to_buddha(utterance):
-        return _enqueue_buddha_job(payload, utterance, background_tasks)
+    knowledge_response = await _handle_knowledge_command(utterance, background_tasks)
+    if knowledge_response is not None:
+        return knowledge_response
 
     url = _extract_url(payload, utterance)
     if not url:
@@ -330,15 +497,3 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
     job = summary_job_store.create(url)
     background_tasks.add_task(_process_summary_job, job.job_id, url)
     return JSONResponse(kakao_job_accepted(job.job_id, job_name="요약"))
-
-
-@app.post("/kakao/skill/buddha")
-async def kakao_buddha_skill(request: Request, background_tasks: BackgroundTasks):
-    payload = await request.json()
-    utterance = _extract_utterance(payload)
-
-    result_job_id = _extract_result_job_id(utterance)
-    if result_job_id:
-        return JSONResponse(_build_cross_result_response(result_job_id))
-
-    return _enqueue_buddha_job(payload, utterance, background_tasks)
