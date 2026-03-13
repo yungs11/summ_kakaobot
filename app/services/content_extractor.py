@@ -89,9 +89,8 @@ def _youtube_video_id(url: str) -> str | None:
     return None
 
 
-def _clean_text(text: str, limit: int = 12000) -> str:
-    compact = re.sub(r"\s+", " ", text or "").strip()
-    return compact[:limit]
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def _extract_html_title(html: str) -> str:
