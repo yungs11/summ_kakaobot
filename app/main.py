@@ -11,7 +11,7 @@ from app.config import Settings
 from app.services.content_extractor import extract_content, extract_first_url
 from app.services.job_store import JobStore
 from app.services.knowledge_service import KnowledgeService
-from app.services.summarizer import summarize_content
+from app.services.summarizer import classify_category, summarize_content
 
 load_dotenv()
 settings = Settings.from_env()
@@ -353,9 +353,12 @@ async def _process_summary_job(job_id: str, url: str) -> None:
             summarize_elapsed,
         )
 
+        category = await classify_category(content.title, summary, settings)
+        logger.info("Category classified: id=%s category=%s", job_id, category)
+
         persist_started = time.perf_counter()
         try:
-            await knowledge_service.ingest_summary(content, summary)
+            await knowledge_service.ingest_summary(content, summary, category)
             persist_elapsed = time.perf_counter() - persist_started
             logger.info(
                 "Knowledge persist done: id=%s elapsed=%.2fs",

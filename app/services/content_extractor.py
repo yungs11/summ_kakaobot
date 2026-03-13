@@ -400,12 +400,30 @@ def _extract_with_yt_dlp(url: str, video_id: str, settings: Settings) -> str:
     return ""
 
 
+def _get_youtube_title(video_id: str, url: str, settings: Settings) -> str:
+    """YouTube oEmbed API로 실제 영상 제목을 가져옴 (인증 불필요)."""
+    try:
+        resp = httpx.get(
+            f"https://www.youtube.com/oembed?url={url}&format=json",
+            timeout=settings.http_timeout_seconds,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        title = resp.json().get("title", "").strip()
+        if title:
+            return title
+    except Exception:  # noqa: BLE001
+        pass
+    return f"YouTube Video ({video_id})"
+
+
 def _extract_from_youtube(url: str, settings: Settings) -> ExtractedContent:
     video_id = _youtube_video_id(url)
     if not video_id:
         raise ValueError("유효한 유튜브 영상 URL이 아닙니다.")
 
-    logger.info("YouTube extraction start: video_id=%s url=%s method=transcript_api", video_id, url)
+    title = _get_youtube_title(video_id, url, settings)
+    logger.info("YouTube extraction start: video_id=%s url=%s title=%r method=transcript_api", video_id, url, title)
 
     transcript = []
     try:
@@ -438,7 +456,7 @@ def _extract_from_youtube(url: str, settings: Settings) -> ExtractedContent:
         return ExtractedContent(
             url=url,
             source_type="youtube",
-            title=f"YouTube Video ({video_id})",
+            title=title,
             content=cleaned,
         )
 
@@ -448,7 +466,7 @@ def _extract_from_youtube(url: str, settings: Settings) -> ExtractedContent:
         return ExtractedContent(
             url=url,
             source_type="youtube",
-            title=f"YouTube Video ({video_id})",
+            title=title,
             content=cleaned,
         )
 

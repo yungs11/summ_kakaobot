@@ -19,7 +19,7 @@ class KnowledgeService:
     def _enabled(self) -> bool:
         return bool(self.settings.rag_service_url)
 
-    async def ingest_summary(self, content: ExtractedContent, summary_text: str) -> None:
+    async def ingest_summary(self, content: ExtractedContent, summary_text: str, category: str = "Other") -> None:
         if not self._enabled:
             logger.info("RAG service not configured (RAG_SERVICE_URL unset), skipping ingest")
             return
@@ -27,7 +27,7 @@ class KnowledgeService:
             "source_url": content.url,
             "source_type": content.source_type,
             "title": content.title or "",
-            "category": "Other",  # TODO: LLM 기반 자동 분류로 교체
+            "category": category,
             "summary_text": summary_text,
             "raw_text": content.content,
             "summary_date": date.today().isoformat(),
