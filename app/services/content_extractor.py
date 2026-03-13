@@ -23,6 +23,47 @@ from app.schemas import ExtractedContent
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
+# 뉴스 도메인 (정확 일치 또는 서브도메인) - 블로그보다 먼저 체크
+_NEWS_DOMAINS = {
+    "techcrunch.com", "zdnet.com", "wired.com", "theverge.com",
+    "reuters.com", "bloomberg.com", "forbes.com", "cnbc.com",
+    "venturebeat.com", "arstechnica.com", "engadget.com",
+    "chosun.com", "joins.com", "hani.co.kr", "khan.co.kr",
+    "yonhapnewstv.co.kr", "yonhap.co.kr", "ytn.co.kr",
+    "etnews.com", "zdnet.co.kr", "itworld.co.kr", "aitimes.com",
+    "news.naver.com", "news.daum.net",
+}
+# 뉴스 URL 경로 패턴 (날짜, /news/, /article/ 등)
+_NEWS_PATH_RE = re.compile(r"/(?:news|article|story|press|release|[0-9]{4}/[0-9]{2})/", re.IGNORECASE)
+
+# 블로그 플랫폼 도메인 (서브도메인 포함)
+_BLOG_DOMAINS = {
+    "medium.com", "substack.com", "tistory.com", "velog.io",
+    "brunch.co.kr", "blog.naver.com",
+    "wordpress.com", "blogspot.com", "ghost.io", "hashnode.dev",
+    "dev.to", "notion.so",
+}
+# 블로그 URL 경로 패턴
+_BLOG_PATH_RE = re.compile(r"/(blog|posts?|b|writing)/", re.IGNORECASE)
+
+
+def _infer_source_type(url: str) -> str:
+    """URL 패턴·도메인으로 source_type 추론: news / blog / other"""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().lstrip("www.")
+    path = parsed.path
+
+    # 뉴스 우선 체크 (news.naver.com 등이 blog.naver.com보다 먼저 매칭되어야 함)
+    if any(host == d or host.endswith("." + d) for d in _NEWS_DOMAINS):
+        return "news"
+    if _NEWS_PATH_RE.search(path):
+        return "news"
+    if any(host == d or host.endswith("." + d) for d in _BLOG_DOMAINS):
+        return "blog"
+    if _BLOG_PATH_RE.search(path):
+        return "blog"
+    return "other"
+
 
 def extract_first_url(text: str) -> str | None:
     match = URL_PATTERN.search(text or "")
@@ -90,7 +131,7 @@ def _extract_from_web(url: str, settings: Settings) -> ExtractedContent:
 
     return ExtractedContent(
         url=final_url,
-        source_type="web",
+        source_type=_infer_source_type(final_url),
         title=title,
         content=cleaned,
     )
