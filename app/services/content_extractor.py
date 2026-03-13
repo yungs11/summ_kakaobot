@@ -100,12 +100,49 @@ def _extract_html_title(html: str) -> str:
     return title or "Untitled"
 
 
-def _extract_from_web(url: str, settings: Settings) -> ExtractedContent:
-    with httpx.Client(timeout=settings.http_timeout_seconds, follow_redirects=True) as client:
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
+
+def _fetch_html(url: str, settings: Settings) -> tuple[str, str]:
+    """(final_url, html) 반환. 403 시 User-Agent 바꿔 재시도."""
+    with httpx.Client(
+        timeout=settings.http_timeout_seconds,
+        follow_redirects=True,
+        headers=_BROWSER_HEADERS,
+    ) as client:
         response = client.get(url)
+
+        if response.status_code == 403:
+            # Googlebot UA로 재시도 (일부 사이트 허용)
+            response = client.get(
+                url,
+                headers={
+                    **_BROWSER_HEADERS,
+                    "User-Agent": "Googlebot/2.1 (+http://www.google.com/bot.html)",
+                },
+            )
+
+        if response.status_code == 403:
+            raise ValueError(
+                f"해당 페이지는 외부 접근을 차단하고 있어 내용을 가져올 수 없습니다. (403 Forbidden)\n"
+                f"URL: {response.url}"
+            )
+
         response.raise_for_status()
-        final_url = str(response.url)
-        html = response.text
+        return str(response.url), response.text
+
+
+def _extract_from_web(url: str, settings: Settings) -> ExtractedContent:
+    final_url, html = _fetch_html(url, settings)
 
     redirected_video_id = _youtube_video_id(final_url)
     if redirected_video_id:
