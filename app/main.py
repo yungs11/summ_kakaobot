@@ -8,10 +8,10 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.config import Settings
-from app.services.content_extractor import extract_content, extract_first_url
+from app.services.content_extractor import extract_content, extract_first_url, is_valid_content
 from app.services.job_store import JobStore
 from app.services.knowledge_service import KnowledgeService
-from app.services.summarizer import classify_category, summarize_content
+from app.services.summarizer import classify_category, is_failed_summary, summarize_content, summarize_from_url
 
 load_dotenv()
 settings = Settings.from_env()
@@ -343,15 +343,29 @@ async def _process_summary_job(job_id: str, url: str) -> None:
             extract_elapsed,
         )
 
-        summarize_started = time.perf_counter()
-        summary = await summarize_content(content, settings)
-        summarize_elapsed = time.perf_counter() - summarize_started
-        logger.info(
-            "Summary llm done: id=%s output_chars=%d elapsed=%.2fs",
-            job_id,
-            len(summary),
-            summarize_elapsed,
-        )
+        # 콘텐츠 유효성 검사: 깨진/빈 텍스트면 URL 폴백 시도
+        if not is_valid_content(content.content):
+            logger.warning("Content invalid or garbled, trying URL-only fallback: id=%s url=%s chars=%d", job_id, url, len(content.content))
+            summary = await summarize_from_url(url, content.title, settings)
+            if is_failed_summary(summary):
+                logger.warning("URL-only fallback also failed: id=%s url=%s", job_id, url)
+                summary_job_store.mark_failed(
+                    job_id,
+                    f"해당 페이지의 내용을 읽을 수 없어 요약에 실패했습니다.\n출처: {url}\n\n접근이 제한된 페이지이거나 콘텐츠를 불러올 수 없습니다.",
+                )
+                return
+            # URL 폴백 성공: content.content는 비어있지만 summary는 저장
+            logger.info("URL-only fallback succeeded: id=%s", job_id)
+        else:
+            summarize_started = time.perf_counter()
+            summary = await summarize_content(content, settings)
+            summarize_elapsed = time.perf_counter() - summarize_started
+            logger.info(
+                "Summary llm done: id=%s output_chars=%d elapsed=%.2fs",
+                job_id,
+                len(summary),
+                summarize_elapsed,
+            )
 
         category = await classify_category(content.title, summary, settings)
         logger.info("Category classified: id=%s category=%s", job_id, category)

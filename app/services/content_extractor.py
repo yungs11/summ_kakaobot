@@ -65,6 +65,17 @@ def _infer_source_type(url: str) -> str:
     return "other"
 
 
+def is_valid_content(text: str) -> bool:
+    """추출된 텍스트가 요약 가능한 유효한 콘텐츠인지 확인."""
+    if not text or len(text.strip()) < 100:
+        return False
+    # 비인쇄 문자(제어문자 등) 비율이 높으면 깨진 콘텐츠로 판단
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\r\t")
+    if printable / len(text) < 0.85:
+        return False
+    return True
+
+
 def extract_first_url(text: str) -> str | None:
     match = URL_PATTERN.search(text or "")
     if not match:
