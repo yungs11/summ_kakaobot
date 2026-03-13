@@ -4,17 +4,19 @@ from app.services.openrouter_client import generate_chat_text
 
 _FAILURE_KEYWORDS = ("요약불가", "알 수 없", "확인 불가", "접근 불가", "내용을 읽을 수 없", "요약할 수 없")
 
-_URL_ONLY_SYSTEM = "You are a helpful assistant that summarizes web content in Korean."
+_URL_ONLY_SYSTEM = (
+    "You are a concise summarizer. Output only the summary in Korean — "
+    "no preambles, no explanations, no meta-commentary. "
+    "If you truly cannot summarize, output only '요약불가' with nothing else."
+)
 
 _URL_ONLY_USER = """\
-다음 URL의 페이지 내용을 한국어로 요약해주세요.
-직접 접근이 어려운 경우, URL과 제목을 바탕으로 알고 있는 정보를 활용해 요약해주세요.
-내용을 전혀 알 수 없으면 '요약불가'라고만 답하세요.
+아래 URL과 제목을 참고해 핵심 내용을 한국어로 3~5문장으로 요약해주세요.
+설명이나 부연 없이 요약문만 출력하세요.
+내용을 알 수 없으면 '요약불가'만 출력하세요.
 
 URL: {url}
-제목: {title}
-
-3~5문장으로 핵심 내용을 요약해주세요."""
+제목: {title}"""
 
 _VALID_CATEGORIES = {"AI/LLM", "Infra", "DB", "Product", "Business", "Financial", "Other"}
 
