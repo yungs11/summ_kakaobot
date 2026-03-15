@@ -1,10 +1,8 @@
 import logging
-from datetime import date
 
 import httpx
 
 from app.config import Settings
-from app.schemas import ExtractedContent
 
 logger = logging.getLogger(__name__)
 
@@ -19,32 +17,17 @@ class KnowledgeService:
     def _enabled(self) -> bool:
         return bool(self.settings.rag_service_url)
 
-    async def ingest_summary(self, content: ExtractedContent, summary_text: str, category: str = "Other") -> None:
+    async def summarize(self, *, url: str, user_id: str | None = None) -> dict:
+        """URL을 rag-service에 전달해 추출·요약·저장을 위임합니다."""
         if not self._enabled:
-            logger.info("RAG service not configured (RAG_SERVICE_URL unset), skipping ingest")
-            return
-        payload = {
-            "source_url": content.url,
-            "source_type": content.source_type,
-            "title": content.title or "",
-            "category": category,
-            "summary_text": summary_text,
-            "raw_text": content.content,
-            "summary_date": date.today().isoformat(),
-        }
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(f"{self.settings.rag_service_url}/ingest", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                logger.info(
-                    "RAG ingest done: document_id=%s created=%s url=%s",
-                    data.get("document_id"),
-                    data.get("created"),
-                    content.url,
-                )
-        except Exception:  # noqa: BLE001
-            logger.exception("RAG ingest failed: url=%s", content.url)
+            raise RuntimeError("RAG service not configured (RAG_SERVICE_URL unset)")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{self.settings.rag_service_url}/summarize",
+                json={"url": url, "user_id": user_id},
+            )
+            resp.raise_for_status()
+            return resp.json()
 
     async def search(
         self,
@@ -52,12 +35,15 @@ class KnowledgeService:
         query: str,
         limit: int = 5,
         category: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
         if not self._enabled:
             return []
         payload: dict = {"query": query, "limit": limit}
         if category:
             payload["category"] = category
+        if user_id:
+            payload["user_id"] = user_id
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(f"{self.settings.rag_service_url}/search", json=payload)
@@ -67,14 +53,17 @@ class KnowledgeService:
             logger.exception("RAG search failed: query=%s", query)
             return []
 
-    async def recent_documents(self, limit: int = 5) -> list[dict]:
+    async def recent_documents(self, limit: int = 5, user_id: str | None = None) -> list[dict]:
         if not self._enabled:
             return []
         try:
+            params: dict = {"limit": limit}
+            if user_id:
+                params["user_id"] = user_id
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f"{self.settings.rag_service_url}/documents/recent",
-                    params={"limit": limit},
+                    params=params,
                 )
                 resp.raise_for_status()
                 return resp.json().get("items", [])
@@ -82,17 +71,31 @@ class KnowledgeService:
             logger.exception("RAG recent_documents failed")
             return []
 
-    async def list_categories(self) -> list[dict]:
+    async def list_categories(self, user_id: str | None = None) -> list[dict]:
         if not self._enabled:
             return []
         try:
+            params: dict = {}
+            if user_id:
+                params["user_id"] = user_id
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(f"{self.settings.rag_service_url}/documents/categories")
+                resp = await client.get(f"{self.settings.rag_service_url}/documents/categories", params=params)
                 resp.raise_for_status()
                 return resp.json().get("items", [])
         except Exception:  # noqa: BLE001
             logger.exception("RAG list_categories failed")
             return []
+
+    async def issue_otp(self, kakao_user_id: str) -> str:
+        if not self._enabled:
+            raise RuntimeError("RAG service not configured")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{self.settings.rag_service_url}/auth/issue-otp",
+                json={"user_id": kakao_user_id},
+            )
+            resp.raise_for_status()
+            return resp.json()["otp"]
 
     async def ask(
         self,
@@ -100,6 +103,7 @@ class KnowledgeService:
         query: str,
         limit: int = 6,
         category: str | None = None,
+        user_id: str | None = None,
     ) -> dict:
         if not self._enabled:
             return {
@@ -110,6 +114,8 @@ class KnowledgeService:
         payload: dict = {"query": query, "limit": limit}
         if category:
             payload["category"] = category
+        if user_id:
+            payload["user_id"] = user_id
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(f"{self.settings.rag_service_url}/ask", json=payload)

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import re
 import time
@@ -8,10 +7,8 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.config import Settings
-from app.services.content_extractor import extract_content, extract_first_url, is_valid_content
 from app.services.job_store import JobStore
 from app.services.knowledge_service import KnowledgeService
-from app.services.summarizer import classify_category, is_failed_summary, summarize_content, summarize_from_url
 
 load_dotenv()
 settings = Settings.from_env()
@@ -31,6 +28,10 @@ KNOWLEDGE_SEARCH_PATTERN = re.compile(r"^\s*지식\s*검색\s+(.+?)\s*$")
 KNOWLEDGE_ASK_PATTERN = re.compile(r"^\s*지식\s*질문\s+(.+?)\s*$")
 RECENT_DOCS_PATTERN = re.compile(r"^\s*(최근\s*문서|최근문서)\s*$")
 CATEGORY_LIST_PATTERN = re.compile(r"^\s*(카테고리\s*목록|카테고리목록)\s*$")
+WEB_LOGIN_PATTERN = re.compile(r"^\s*(웹\s*로그인|web\s*login)\s*$", re.IGNORECASE)
+WEB_URL_PATTERN = re.compile(r"^\s*(웹\s*주소|웹주소|web\s*url|사이트\s*주소|사이트주소)\s*$", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+KAKAO_FILE_PATTERN = re.compile(r"^\s*\[(PDF converted|File|이미지|사진|동영상)\]", re.IGNORECASE)
 
 
 def _sanitize_text(text: str) -> str:
@@ -71,12 +72,7 @@ def _split_for_kakao(text: str) -> list[str]:
 
 def kakao_simple_text(text: str) -> dict:
     outputs = [{"simpleText": {"text": chunk}} for chunk in _split_for_kakao(text)]
-    return {
-        "version": "2.0",
-        "template": {
-            "outputs": outputs,
-        },
-    }
+    return {"version": "2.0", "template": {"outputs": outputs}}
 
 
 def kakao_text_response(text: str, quick_replies: list[dict] | None = None) -> dict:
@@ -102,11 +98,7 @@ def kakao_job_accepted(job_id: str, job_name: str = "요약", result_cmd: str = 
                 }
             ],
             "quickReplies": [
-                {
-                    "label": "결과 확인",
-                    "action": "message",
-                    "messageText": f"{result_cmd} {job_id}",
-                }
+                {"label": "결과 확인", "action": "message", "messageText": f"{result_cmd} {job_id}"}
             ],
         },
     }
@@ -127,11 +119,7 @@ def kakao_job_processing(job_id: str, result_cmd: str = "/결과") -> dict:
                 }
             ],
             "quickReplies": [
-                {
-                    "label": "결과 확인",
-                    "action": "message",
-                    "messageText": f"{result_cmd} {job_id}",
-                }
+                {"label": "결과 확인", "action": "message", "messageText": f"{result_cmd} {job_id}"}
             ],
         },
     }
@@ -145,39 +133,41 @@ def _extract_utterance(payload: dict) -> str:
     return ""
 
 
+def _extract_kakao_user_id(payload: dict) -> str | None:
+    user_request = payload.get("userRequest", {})
+    user = user_request.get("user", {}) if isinstance(user_request, dict) else {}
+    uid = user.get("id") if isinstance(user, dict) else None
+    return str(uid).strip() if isinstance(uid, str) and uid.strip() else None
+
+
 def _extract_result_job_id(utterance: str) -> str | None:
     match = RESULT_CMD_PATTERN.match(utterance or "")
-    if not match:
-        return None
-    return match.group(1)
+    return match.group(1) if match else None
 
 
 def _extract_url(payload: dict, utterance: str) -> str | None:
-    url = extract_first_url(utterance)
-    if url:
-        return url
+    match = URL_PATTERN.search(utterance or "")
+    if match:
+        return match.group(0).rstrip(').,\"\'')
 
     action = payload.get("action", {})
     params = action.get("params", {}) if isinstance(action, dict) else {}
     param_url = params.get("url") if isinstance(params, dict) else None
     if isinstance(param_url, str):
-        return extract_first_url(param_url) or param_url.strip()
+        m = URL_PATTERN.search(param_url)
+        return m.group(0).rstrip(').,\"\'') if m else param_url.strip()
 
     return None
 
 
 def _extract_knowledge_search_query(utterance: str) -> str | None:
     match = KNOWLEDGE_SEARCH_PATTERN.match(utterance or "")
-    if not match:
-        return None
-    return match.group(1).strip()
+    return match.group(1).strip() if match else None
 
 
 def _extract_knowledge_ask_query(utterance: str) -> str | None:
     match = KNOWLEDGE_ASK_PATTERN.match(utterance or "")
-    if not match:
-        return None
-    return match.group(1).strip()
+    return match.group(1).strip() if match else None
 
 
 def _is_recent_documents_command(utterance: str) -> bool:
@@ -200,7 +190,10 @@ def _build_summary_help_message() -> str:
         "- 지식 검색 <키워드>\n"
         "- 지식 질문 <질문>\n"
         "- 최근 문서\n"
-        "- 카테고리 목록"
+        "- 카테고리 목록\n\n"
+        "웹앱\n"
+        "- 웹 주소: 웹앱 접속 주소 확인\n"
+        "- 웹 로그인: 웹앱 로그인 코드 발급"
     )
 
 
@@ -286,11 +279,7 @@ def _format_category_list(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_result_message(
-    job_store: JobStore,
-    job_id: str,
-    result_cmd: str = "/결과",
-) -> str:
+def _build_result_message(job_store: JobStore, job_id: str, result_cmd: str = "/결과") -> str:
     job = job_store.get(job_id)
     if not job:
         return (
@@ -328,74 +317,32 @@ def _build_cross_result_response(job_id: str, result_cmd: str = "/결과") -> di
     )
 
 
-async def _process_summary_job(job_id: str, url: str) -> None:
+async def _process_summary_job(job_id: str, url: str, user_id: str | None = None) -> None:
     started = time.perf_counter()
     summary_job_store.mark_processing(job_id)
     try:
-        extract_started = time.perf_counter()
-        content = await asyncio.to_thread(extract_content, url, settings)
-        extract_elapsed = time.perf_counter() - extract_started
-        logger.info(
-            "Summary extract done: id=%s source_type=%s chars=%d elapsed=%.2fs",
-            job_id,
-            content.source_type,
-            len(content.content),
-            extract_elapsed,
-        )
-
-        # 콘텐츠 유효성 검사: 깨진/빈 텍스트면 URL 폴백 시도
-        if not is_valid_content(content.content):
-            logger.warning("Content invalid or garbled, trying URL-only fallback: id=%s url=%s chars=%d", job_id, url, len(content.content))
-            summary = await summarize_from_url(url, content.title, settings)
-            if is_failed_summary(summary):
-                logger.warning("URL-only fallback also failed: id=%s url=%s", job_id, url)
-                summary_job_store.mark_failed(
-                    job_id,
-                    f"해당 페이지의 내용을 읽을 수 없어 요약에 실패했습니다.\n출처: {url}\n\n접근이 제한된 페이지이거나 콘텐츠를 불러올 수 없습니다.",
-                )
-                return
-            # URL 폴백 성공: content.content는 비어있지만 summary는 저장
-            logger.info("URL-only fallback succeeded: id=%s", job_id)
+        result = await knowledge_service.summarize(url=url, user_id=user_id)
+        if result.get("status") == "ok":
+            if result.get("created") is False:
+                header = f"[기존 문서] 동일한 URL이 이미 DB에 저장되어 있어 새로 저장되지 않았습니다.\n{url}"
+            else:
+                header = f"[요약 완료] {url}"
+            message = f"{header}\n\n{result['summary']}"
         else:
-            summarize_started = time.perf_counter()
-            summary = await summarize_content(content, settings)
-            summarize_elapsed = time.perf_counter() - summarize_started
-            logger.info(
-                "Summary llm done: id=%s output_chars=%d elapsed=%.2fs",
-                job_id,
-                len(summary),
-                summarize_elapsed,
-            )
-
-        category = await classify_category(content.title, summary, settings)
-        logger.info("Category classified: id=%s category=%s", job_id, category)
-
-        persist_started = time.perf_counter()
-        try:
-            await knowledge_service.ingest_summary(content, summary, category)
-            persist_elapsed = time.perf_counter() - persist_started
-            logger.info(
-                "Knowledge persist done: id=%s elapsed=%.2fs",
-                job_id,
-                persist_elapsed,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Knowledge persist failed: id=%s url=%s", job_id, url)
-
-        message = f"[요약 완료] {url}\n\n{summary}"
+            message = result.get("message", f"[요약 불가] {url}")
         summary_job_store.mark_done(job_id, message)
         elapsed = time.perf_counter() - started
-        logger.info("Summary job done: id=%s, time=%.2fs, summary_len=%d", job_id, elapsed, len(summary))
+        logger.info("Summary job done: id=%s time=%.2fs", job_id, elapsed)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to process summary job. id=%s url=%s", job_id, url)
         summary_job_store.mark_failed(job_id, str(exc))
 
 
-async def _process_knowledge_job(job_id: str, query: str) -> None:
+async def _process_knowledge_job(job_id: str, query: str, user_id: str | None = None) -> None:
     started = time.perf_counter()
     knowledge_job_store.mark_processing(job_id)
     try:
-        result = await knowledge_service.ask(query=query, limit=5)
+        result = await knowledge_service.ask(query=query, limit=5, user_id=user_id)
         message_parts = [f"[지식 답변]\n\n{result['answer']}"]
         if result["sources"]:
             message_parts.append("\n출처")
@@ -403,41 +350,41 @@ async def _process_knowledge_job(job_id: str, query: str) -> None:
         message = "\n".join(message_parts)
         knowledge_job_store.mark_done(job_id, message)
         elapsed = time.perf_counter() - started
-        logger.info("Knowledge job done: id=%s, time=%.2fs, answer_len=%d", job_id, elapsed, len(message))
+        logger.info("Knowledge job done: id=%s time=%.2fs", job_id, elapsed)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to process knowledge job. id=%s", job_id)
         knowledge_job_store.mark_failed(job_id, str(exc))
 
 
-def _enqueue_knowledge_job(query: str, background_tasks: BackgroundTasks) -> JSONResponse:
+def _enqueue_knowledge_job(query: str, background_tasks: BackgroundTasks, user_id: str | None = None) -> JSONResponse:
     if not query:
         return JSONResponse(kakao_text_response(_build_knowledge_help_message(), _build_knowledge_quick_replies()))
 
     job = knowledge_job_store.create(query)
-    background_tasks.add_task(_process_knowledge_job, job.job_id, query)
+    background_tasks.add_task(_process_knowledge_job, job.job_id, query, user_id)
     return JSONResponse(kakao_job_accepted(job.job_id, job_name="지식 답변"))
 
 
-async def _handle_knowledge_command(utterance: str, background_tasks: BackgroundTasks) -> JSONResponse | None:
+async def _handle_knowledge_command(utterance: str, background_tasks: BackgroundTasks, user_id: str | None = None) -> JSONResponse | None:
     search_query = _extract_knowledge_search_query(utterance)
     if search_query is not None:
-        items = await knowledge_service.search(query=search_query, limit=5)
+        items = await knowledge_service.search(query=search_query, limit=5, user_id=user_id)
         return JSONResponse(
             kakao_text_response(_format_knowledge_search_results(search_query, items), _build_knowledge_quick_replies())
         )
 
     ask_query = _extract_knowledge_ask_query(utterance)
     if ask_query is not None:
-        return _enqueue_knowledge_job(ask_query, background_tasks)
+        return _enqueue_knowledge_job(ask_query, background_tasks, user_id=user_id)
 
     if _is_recent_documents_command(utterance):
-        items = await knowledge_service.recent_documents(limit=5)
+        items = await knowledge_service.recent_documents(limit=5, user_id=user_id)
         return JSONResponse(
             kakao_text_response(_format_recent_documents(items), _build_knowledge_quick_replies())
         )
 
     if _is_category_list_command(utterance):
-        items = await knowledge_service.list_categories()
+        items = await knowledge_service.list_categories(user_id=user_id)
         return JSONResponse(
             kakao_text_response(_format_category_list(items), _build_knowledge_quick_replies())
         )
@@ -470,40 +417,59 @@ async def knowledge_ask(request: Request):
     payload = await request.json()
     query = str(payload.get("query", "")).strip()
     if not query:
-        return JSONResponse(
-            {
-                "query": "",
-                "answer": "질문을 입력해 주세요.",
-                "sources": [],
-                "hits": [],
-            }
-        )
+        return JSONResponse({"query": "", "answer": "질문을 입력해 주세요.", "sources": [], "hits": []})
 
     limit = int(payload.get("limit", 6))
     category = payload.get("category")
     category_str = str(category).strip() if isinstance(category, str) and category.strip() else None
 
     result = await knowledge_service.ask(query=query, limit=limit, category=category_str)
-    return JSONResponse(
-        {
-            "query": query,
-            "answer": result["answer"],
-            "sources": result["sources"],
-            "hits": result["hits"],
-        }
-    )
+    return JSONResponse({
+        "query": query,
+        "answer": result["answer"],
+        "sources": result["sources"],
+        "hits": result["hits"],
+    })
 
 
 @app.post("/kakao/skill")
 async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
+    logger.info("KAKAO_PAYLOAD: %s", payload)
     utterance = _extract_utterance(payload)
+    kakao_user_id = _extract_kakao_user_id(payload)
 
     result_job_id = _extract_result_job_id(utterance)
     if result_job_id:
         return JSONResponse(_build_cross_result_response(result_job_id))
 
-    knowledge_response = await _handle_knowledge_command(utterance, background_tasks)
+    if WEB_URL_PATTERN.match(utterance):
+        url = settings.web_app_url
+        if url:
+            return JSONResponse(kakao_simple_text(f"웹앱 주소\n{url}"))
+        return JSONResponse(kakao_simple_text("웹앱 주소가 설정되어 있지 않습니다.\n관리자에게 문의하세요."))
+
+    if WEB_LOGIN_PATTERN.match(utterance):
+        if not kakao_user_id:
+            return JSONResponse(kakao_simple_text("사용자 ID를 확인할 수 없습니다."))
+        try:
+            otp = await knowledge_service.issue_otp(kakao_user_id)
+            msg = f"웹 로그인 코드: {otp}\n\n5분 내에 웹앱 로그인 페이지에서 입력하세요.\n(1회 사용 후 만료)"
+        except Exception:
+            logger.exception("OTP 발급 실패")
+            msg = "로그인 코드 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
+        return JSONResponse(kakao_simple_text(msg))
+
+    if KAKAO_FILE_PATTERN.match(utterance):
+        return JSONResponse(kakao_simple_text(
+            "카카오톡에서 직접 파일을 공유하면 파일 내용을 가져올 수 없습니다.\n\n"
+            "PDF/Word 파일을 요약하려면:\n"
+            "1) 파일을 외부에 업로드 후 공개 URL을 전달하세요.\n"
+            "   예: Google Drive 공유 링크, GitHub raw 링크\n"
+            "2) 또는 웹앱에서 직접 파일을 업로드하세요."
+        ))
+
+    knowledge_response = await _handle_knowledge_command(utterance, background_tasks, user_id=kakao_user_id)
     if knowledge_response is not None:
         return knowledge_response
 
@@ -512,5 +478,5 @@ async def kakao_skill(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(kakao_simple_text(_build_summary_help_message()))
 
     job = summary_job_store.create(url)
-    background_tasks.add_task(_process_summary_job, job.job_id, url)
+    background_tasks.add_task(_process_summary_job, job.job_id, url, kakao_user_id)
     return JSONResponse(kakao_job_accepted(job.job_id, job_name="요약"))
